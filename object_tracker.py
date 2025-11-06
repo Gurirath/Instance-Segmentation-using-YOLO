@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -39,6 +38,12 @@ current_mask_index = None
 edited_masks_dict = {}
 # Store original masks for reset: {track_id: {'mask': mask, 'center': (x, y)}}
 original_masks_dict = {}
+
+# --- NEW: Tracking Trail Globals ---
+track_history = {} # Store lists of points: {track_id: [(x,y), (x,y), ...]}
+TRAIL_LENGTH = 30  # How many points to store per trail
+# --- END NEW ---
+
 
 '''def release_and_open_camera(new_index):
     global cap, cam_device_index
@@ -245,23 +250,40 @@ def gui_thread():
 
 
 def reset_track():
-    global selected_track_id, last_seen_time, edit_mode, paused_frame
+    global selected_track_id, last_seen_time, edit_mode, paused_frame, track_history
     selected_track_id = None
     last_seen_time = None
+    
+    # --- NEW: Clear all trails when resetting ---
+    track_history.clear()
+    # --- END NEW ---
+
     if edit_mode:
         edit_mode = False
         paused_frame = None
         cv2.setMouseCallback('Object Tracker', mouse_callback)
 
+
 def clear_mask_edits():
-    global selected_track_id
+    # --- 1. Add edit_mode and paused_frame to globals ---
+    global selected_track_id, edit_mode, paused_frame 
+
+    # --- 2. MODIFIED: Delete the edit, don't just reset it ---
     if selected_track_id in edited_masks_dict:
-        # Restore to original mask if available
-        if selected_track_id in original_masks_dict:
-            edited_masks_dict[selected_track_id] = original_masks_dict[selected_track_id].copy()
-        else:
-            del edited_masks_dict[selected_track_id]
-        print(f"Cleared mask edits for track ID {selected_track_id}, restored to original")
+        # By deleting the key, the main loop's logic:
+        # 'if track_id in edited_masks_dict:'
+        # will become FALSE, forcing it to use the live model's mask.
+        del edited_masks_dict[selected_track_id]
+        print(f"Cleared mask edit for track ID {selected_track_id}. Resuming live detection.")
+
+    # --- 3. NEW: Add logic to exit edit mode ---
+    # This is the part that fixes the "stuck" frame.
+    if edit_mode:
+        edit_mode = False
+        paused_frame = None
+        cv2.setMouseCallback('Object Tracker', mouse_callback) # Reset mouse for picking
+        print("Exiting edit mode, resuming live tracking.")
+
 
 '''def reset_to_laptop_cam():
     print("Resetting to laptop webcam (device 0).")
@@ -420,6 +442,10 @@ while True:
                     
                     overlay = combined_frame.copy() # 'overlay' is now defined
                     masks_data = []
+                    
+                    # --- NEW: Set to store all track IDs seen in this frame ---
+                    current_track_ids = set()
+                    # --- END NEW ---
 
                     if results[0].masks is not None:
                         masks = results[0].masks.data.cpu().numpy()
@@ -428,6 +454,11 @@ while True:
 
                         for i, mask in enumerate(masks):
                             track_id = int(track_ids[i]) if len(track_ids) > i else i
+                            
+                            # --- NEW: Add ID to our set of current tracks ---
+                            current_track_ids.add(track_id)
+                            # --- END NEW ---
+
                             mask_resized = cv2.resize(mask, (combined_frame.shape[1], combined_frame.shape[0]), interpolation=cv2.INTER_NEAREST)
                             mask_binary = (mask_resized > 0.5).astype(np.uint8)
 
@@ -435,6 +466,18 @@ while True:
                             if boxes is not None and i < len(boxes):
                                 x1, y1, x2, y2 = boxes[i]
                                 current_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                                
+                                # --- NEW: Add point to trail history ---
+                                if track_id not in track_history:
+                                    track_history[track_id] = []
+                                # Add the new center point, converting to integer tuple
+                                track_history[track_id].append((int(current_center[0]), int(current_center[1])))
+                                
+                                # Limit the trail length
+                                if len(track_history[track_id]) > TRAIL_LENGTH:
+                                    track_history[track_id].pop(0) # Remove the oldest point
+                                # --- END NEW ---
+
 
                             if track_id in edited_masks_dict and current_center is not None:
                                 original_center = edited_masks_dict[track_id]['center']
@@ -450,7 +493,7 @@ while True:
                                     last_seen_time = time.time()
 
                                 
-                
+                    
                                 # --- 1. Draw the transparent color fill ---
                                 # We can re-enable this now that the 'continue' bug is fixed
                                 colored_mask = np.zeros_like(combined_frame)
@@ -463,6 +506,27 @@ while True:
                                 cv2.drawContours(overlay, contours, -1, color, 2)
 
                             masks_data.append((mask_binary, track_id))
+
+                    
+                    # --- NEW: Clean up old trails ---
+                    # Create a copy of the keys to safely delete from the dict
+                    for old_track_id in list(track_history.keys()):
+                        if old_track_id not in current_track_ids:
+                            # This object is no longer being tracked
+                            del track_history[old_track_id]
+                    # --- END NEW ---
+
+                    # --- NEW: Draw all tracking trails ---
+                    for track_id, points in track_history.items():
+                        if len(points) > 1:
+                            pts = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
+                            # Use a fixed color for all trails for simplicity
+                            trail_color = (255, 150, 0) # Light blue
+                            
+                            # Draw the lines on the overlay
+                            cv2.polylines(overlay, [pts], isClosed=False, color=trail_color, thickness=2)
+                    # --- END NEW ---
+
 
                     if selected_track_id is not None and last_seen_time and (time.time() - last_seen_time) > RESET_TIMEOUT:
                         print(f"Selected object lost for {RESET_TIMEOUT}s. Resetting to multi-object mode.")
